@@ -75,8 +75,11 @@ void outb (uint16_t _port, uint8_t val) {
     __asm__ __volatile__ ("outb %0, %1" : : "a" (val),  "dN" (_port) );
 }
 
-uint8_t inb (uint16_t _port);
-
+uint8_t inb (uint16_t _port) {
+	uint8_t ret;
+	__asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(_port));
+	return ret;
+}
 
 void memset(char *s, char c, unsigned int n) {
     for(int k = 0; k < n ; k++) {
