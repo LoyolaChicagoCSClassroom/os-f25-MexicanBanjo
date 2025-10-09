@@ -1,6 +1,7 @@
 
 #include <stdint.h>
 #include "rprintf.h"
+#include "interrupt.h"
 
 #define MEMORY 0xB8000
 #define WIDTH  80
@@ -43,6 +44,11 @@ int putc(int data) { //Deliverable 1.
 }
 
 void main() {
+    remap_pic();
+    load_gdt();
+    init_idt();
+    esp_printf(putc, "Initializing interrupts...\n");
+    asm("sti");
     esp_printf(putc, "Kernel initialized.\n");
     esp_printf(putc, "Current execution level: %d\n", 0); // Prints current execution. Deliverable 2.
     //for (int i = 0; i < 30; i++) { // THIS IS FOR TESTING SCROLL. Deliverable 3.
