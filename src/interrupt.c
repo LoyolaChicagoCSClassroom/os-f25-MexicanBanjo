@@ -422,7 +422,7 @@ __attribute__((interrupt)) void pit_handler(struct interrupt_frame* frame)
     while(1);
 }
 
-extern int putc(int);
+extern int kputc(int);
 __attribute__((interrupt)) void keyboard_handler(struct interrupt_frame* frame)
 {
     uint8_t scancode = inb(0x60);
@@ -431,7 +431,7 @@ __attribute__((interrupt)) void keyboard_handler(struct interrupt_frame* frame)
     if (!(scancode & 0x80)) {
         unsigned char c = keyboard_map[scancode];
         if (c) {
-            esp_printf(putc, "%c", c);
+            esp_printf(kputc, "%c", c);
         }
     }
 

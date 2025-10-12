@@ -1,7 +1,9 @@
 
 #include <stdint.h>
+#include <stdio.h>
 #include "rprintf.h"
 #include "interrupt.h"
+#include "page.h"
 
 #define MEMORY 0xB8000
 #define WIDTH  80
@@ -14,7 +16,7 @@ static int cursor_row = 0;
 static int cursor_col = 0;
 static const uint8_t vga_color = 0x07;
 
-int putc(int data) { //Deliverable 1.
+int kputc(int data) { //Deliverable 1.
     volatile uint16_t *vram = (uint16_t*)MEMORY;
     if (data == '\n') {
         cursor_col = 0; 
@@ -47,12 +49,15 @@ void main() {
     remap_pic();
     load_gdt();
     init_idt();
-    esp_printf(putc, "Initializing interrupts...\n");
+    esp_printf(kputc, "Initializing interrupts...\n");
     asm("sti");
-    esp_printf(putc, "Kernel initialized.\n");
-    esp_printf(putc, "Current execution level: %d\n", 0); // Prints current execution. Deliverable 2.
+    esp_printf(kputc, "Kernel initialized.\n");
+    esp_printf(kputc, "Current execution level: %d\n", 0); // Prints current execution. Deliverable 2.
     //for (int i = 0; i < 30; i++) { // THIS IS FOR TESTING SCROLL. Deliverable 3.
         //esp_printf(putc, "Line %d: This is a test of the terminal scroll.\n", i);
     //}
+    init_pfa_list();
+    struct ppage *alloc = allocate_physical_pages(3);
+    free_physical_pages(alloc);
     while(1) { }
 }
