@@ -27,6 +27,7 @@ OBJS = \
 	rprintf.o \
 	interrupt.o \
 	page.o \
+	paging.o \
 
 # Make sure to keep a blank line here after OBJS list
 
@@ -56,7 +57,7 @@ rootfs.img:
 	echo 'start=2048, type=83, bootable' | sfdisk rootfs.img
 	mkfs.vfat --offset 2048 -F16 rootfs.img
 	mcopy -i rootfs.img@@1M kernel ::/
-	mmd -i rootfs.img@@1M boot 
+	mmd -i rootfs.img@@1M boot
 	mcopy -i rootfs.img@@1M grub.cfg ::/boot
 	@echo " -- BUILD COMPLETED SUCCESSFULLY --"
 
@@ -65,7 +66,8 @@ run:
 	qemu-system-i386 -hda rootfs.img
 
 debug:
-	./launch_qemu.sh
+	screen -S qemu -d -m qemu-system-i386 -S -s -hda rootfs.img -monitor stdio
+	TERM=xterm i386-unknown-elf-gdb -x gdb_os.txt && killall qemu-system-i386
 
 clean:
 	rm -f grub.img kernel rootfs.img obj/*
