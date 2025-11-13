@@ -53,12 +53,50 @@ void main() {
     esp_printf(kputc, "Initializing interrupts...\n");
     asm("sti");
     esp_printf(kputc, "Kernel initialized.\n");
-    esp_printf(kputc, "Current execution level: %d\n", 0); // Prints current execution. Deliverable 2.
-    //for (int i = 0; i < 30; i++) { // THIS IS FOR TESTING SCROLL. Deliverable 3.
-        //esp_printf(putc, "Line %d: This is a test of the terminal scroll.\n", i);
-    //}
+
+    esp_printf(kputc, "Current execution level: %d\n", 0);
+
+    // Initialize physical frame allocator (your existing function)
     init_pfa_list();
-    struct ppage *alloc = allocate_physical_pages(3);
-    free_physical_pages(alloc);
+    esp_printf(kputc, "Physical frame allocator ready.\n");
+
+    // ✅ Allocate a small list of 3 pages
+    struct ppage *pglist = allocate_physical_pages(3);
+    if (!pglist) {
+        esp_printf(kputc, "Failed to allocate test pages.\n");
+        while(1);
+    }
+
+    // ✅ Pick a virtual address to map them to
+    void *virt = (void*)0xC0000000; // 3 pages starting here
+
+    esp_printf(kputc, "Mapping pages starting at virtual 0x%p\n", virt);
+
+    // ✅ Call your map_pages() using the global page directory
+    map_pages(virt, pglist, pd);
+
+    // ✅ Load page directory and enable paging
+    loadPageDirectory(pd);
+    enable_paging();
+
+    esp_printf(kputc, "Paging enabled.\n");
+
+    // ✅ Test writing/reading to the mapped virtual memory
+    uint32_t *test_ptr = (uint32_t*)virt;
+    test_ptr[0] = 0xDEADBEEF;
+    test_ptr[1] = 0xCAFEBABE;
+
+    esp_printf(kputc, "Wrote test values to mapped pages.\n");
+
+    // Read them back
+    uint32_t a = test_ptr[0];
+    uint32_t b = test_ptr[1];
+    esp_printf(kputc, "Read back values: a=0x%x, b=0x%x\n", a, b);
+
+    // ✅ Cleanup: free physical pages after test
+    free_physical_pages(pglist);
+    esp_printf(kputc, "Freed test pages.\n");
+
+    // Halt kernel (or loop forever)
     while(1) { }
 }
