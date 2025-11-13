@@ -1,304 +1,346 @@
-// fat.c
-// Implements fatInit(), fatOpen(), fatRead() for FAT12/FAT16
-// Uses ata_lba_read(lba, buffer, nsectors) provided in ide.s / ide.h
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
+/*
+ * fat.c - heapless FAT12/FAT16 reader for a freestanding kernel
+ *
+ * Provides:
+ *   int fatInit(void);
+ *   struct file *fatOpen(const char *filename);
+ *   int fatRead(struct file *f, void *buf, uint32_t count, uint32_t offset);
+ *
+ * Uses ata_lba_read(lba, buffer, nsectors) from ide.s (declared in ide.h).
+ *
+ * No dynamic memory; no libc calls. Conservative static buffers.
+ */
+
 #include "fat.h"
-#include "ide.h"   // declares ata_lba_read
+#include "ide.h"   /* provides ata_lba_read(unsigned int lba, unsigned char *buf, unsigned int nsectors) */
+#include <stdint.h>
 
-/* Globals the assignment expects (simple driver state) */
-static struct boot_sector bootsector_buf __attribute__((aligned(4)));
-static unsigned char *fat_table = NULL;
-static unsigned int fat_sectors = 0;
+/* If SECTOR_SIZE wasn't defined in fat.h, define it here */
+#ifndef SECTOR_SIZE
+#define SECTOR_SIZE 512
+#endif
+
+/* Configuration limits (adjust if your image is larger) */
+#define ROOTDIR_MAX_SECTORS 64    /* 64 * 512 = 32768 bytes for root dir */
+#define FAT_SECTOR_CACHE_COUNT 2  /* we may need to peek into adjacent FAT sector for FAT12 */
+
+/* Static driver state (no malloc) */
+static struct boot_sector bs __attribute__((aligned(4)));
 static unsigned int reserved_sectors = 0;
 static unsigned int num_fats = 0;
+static unsigned int sectors_per_fat = 0;
 static unsigned int root_dir_entries = 0;
 static unsigned int root_dir_sectors = 0;
-static unsigned int root_dir_start_sector = 0;
-static unsigned int sectors_per_fat = 0;
-static unsigned int bytes_per_sector = SECTOR_SIZE;
-static unsigned int sectors_per_cluster = 0;
+static unsigned int root_dir_start = 0;
 static unsigned int first_data_sector = 0;
+static unsigned int sectors_per_cluster = 0;
 static unsigned int total_sectors = 0;
-static int fat_type = 16; /* 12 or 16; default 16 */
+static int fat_type = 16; /* 12 or 16; 32 unsupported */
 
-/* Helper: read sectors from disk into buffer (wrap ata_lba_read) */
-static int read_sectors(unsigned int start_sector, unsigned char *buf, unsigned int nsectors) {
-    int r = ata_lba_read(start_sector, buf, nsectors);
-    if (r < 0) return -1;
+/* Static buffers */
+static unsigned char rootdir_buf[ROOTDIR_MAX_SECTORS * SECTOR_SIZE] __attribute__((aligned(4)));
+static unsigned int rootdir_sectors_read = 0;
+
+/* FAT sector cache (we will cache up to 2 consecutive FAT sectors for FAT12 reads) */
+static unsigned char fat_cache[FAT_SECTOR_CACHE_COUNT * SECTOR_SIZE] __attribute__((aligned(4)));
+static unsigned int fat_cache_base_sector = (unsigned int)-1; /* invalid */
+
+/* --------------------------------------------------
+   Minimal helpers (no libc)
+   -------------------------------------------------- */
+
+/* simple memory copy */
+static void kmemcpy(void *dst, const void *src, unsigned int n) {
+    unsigned char *d = (unsigned char*)dst;
+    const unsigned char *s = (const unsigned char*)src;
+    while (n--) *d++ = *s++;
+}
+
+/* simple memcmp */
+static int kmemcmp(const void *a, const void *b, unsigned int n) {
+    const unsigned char *x = (const unsigned char*)a;
+    const unsigned char *y = (const unsigned char*)b;
+    for (unsigned int i = 0; i < n; ++i) {
+        if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    }
     return 0;
 }
 
-/* Helper: determine FAT type (12/16) based on total clusters */
-static void determine_fat_type(void) {
-    unsigned int data_sectors = total_sectors - first_data_sector;
-    unsigned int total_clusters = data_sectors / bootsector_buf.num_sectors_per_cluster;
-    if (total_clusters < 4085) fat_type = 12;
-    else if (total_clusters < 65525) fat_type = 16;
-    else fat_type = 32; /* not supported here */
+/* toupper for ASCII letters */
+static int ktoupper(int c) {
+    if (c >= 'a' && c <= 'z') return c - ('a' - 'A');
+    return c;
 }
 
-/* Helper: compute root_dir_sectors and first_data_sector */
-static void compute_layout(void) {
-    reserved_sectors = bootsector_buf.num_reserved_sectors;
-    num_fats = bootsector_buf.num_fat_tables;
-    root_dir_entries = bootsector_buf.num_root_dir_entries;
-    sectors_per_fat = bootsector_buf.num_sectors_per_fat;
-    sectors_per_cluster = bootsector_buf.num_sectors_per_cluster;
-    /* total_sectors field selection */
-    if (bootsector_buf.total_sectors != 0) total_sectors = bootsector_buf.total_sectors;
-    else total_sectors = bootsector_buf.total_sectors_in_fs;
-
-    /* Root dir size in sectors */
-    root_dir_sectors = ((root_dir_entries * 32) + (bytes_per_sector - 1)) / bytes_per_sector;
-
-    /* Root directory start (reserved + fats) */
-    root_dir_start_sector = reserved_sectors + (num_fats * sectors_per_fat);
-
-    /* First data sector */
-    first_data_sector = root_dir_start_sector + root_dir_sectors;
+/* Simple strlen */
+static unsigned int kstrlen(const char *s) {
+    unsigned int n = 0;
+    while (s[n]) ++n;
+    return n;
 }
 
-/* Helper: Get FAT entry for given cluster (works for FAT12 and FAT16) */
+/* --------------------------------------------------
+   Disk helpers
+   -------------------------------------------------- */
+
+/* Read sectors using provided SD/IDE driver */
+static int read_sectors(unsigned int lba, unsigned char *buf, unsigned int nsectors) {
+    /* ata_lba_read returns 0 on success (as ide.s coded) or -1 on failure */
+    return ata_lba_read(lba, buf, nsectors);
+}
+
+/* Read a single FAT sector into fat_cache at index 0 (and optionally index 1 for neighbor) */
+static int cache_fat_sector(unsigned int fat_sector_index_abs) {
+    unsigned int fat_lba = reserved_sectors + fat_sector_index_abs; /* FAT table starts at reserved_sectors */
+    /* read the requested sector into cache[0] */
+    if (read_sectors(fat_lba, fat_cache, 1) < 0) return -1;
+    /* try to read the next sector into cache[SECTOR_SIZE] (for cross-boundary reads) */
+    if (read_sectors(fat_lba + 1, fat_cache + SECTOR_SIZE, 1) < 0) {
+        /* it's ok if next sector read fails (maybe last sector) - zero it */
+        for (unsigned int i = 0; i < SECTOR_SIZE; ++i) fat_cache[SECTOR_SIZE + i] = 0;
+    }
+    fat_cache_base_sector = fat_sector_index_abs;
+    return 0;
+}
+
+/* Access FAT entry for cluster (supports FAT12 and FAT16) */
 static uint32_t get_fat_entry(uint32_t cluster) {
-    if (!fat_table) return 0xFFFFFFFF;
-
     if (fat_type == 16) {
-        uint16_t *ft = (uint16_t*)fat_table;
-        return (uint32_t)ft[cluster];
-    } else if (fat_type == 12) {
-        /* FAT12: 12 bits per entry (packed). Compute byte offset */
-        uint32_t offset = (cluster * 3) / 2;
-        uint16_t value = fat_table[offset] | (fat_table[offset + 1] << 8);
-        if (cluster & 1) {
-            value = (value >> 4) & 0x0FFF;
-        } else {
-            value = value & 0x0FFF;
+        /* 2 bytes per entry */
+        uint32_t byte_offset = cluster * 2;
+        unsigned int sector_index = byte_offset / SECTOR_SIZE;
+        unsigned int in_sector = byte_offset % SECTOR_SIZE;
+
+        if (sector_index != fat_cache_base_sector) {
+            if (cache_fat_sector(sector_index) < 0) return 0xFFFFFFFF;
         }
-        return (uint32_t)value;
+        /* little endian */
+        uint16_t lo = fat_cache[in_sector];
+        uint16_t hi;
+        if (in_sector + 1 < SECTOR_SIZE) hi = fat_cache[in_sector + 1];
+        else hi = fat_cache[SECTOR_SIZE]; /* from cached next sector */
+        return (uint32_t)(lo | (hi << 8));
+    } else if (fat_type == 12) {
+        /* 12 bits per entry (packed). Each pair of entries occupy 3 bytes */
+        uint32_t byte_offset = (cluster * 3) / 2;
+        unsigned int sector_index = byte_offset / SECTOR_SIZE;
+        unsigned int in_sector = byte_offset % SECTOR_SIZE;
+
+        if (sector_index != fat_cache_base_sector) {
+            if (cache_fat_sector(sector_index) < 0) return 0xFFFFFFFF;
+        }
+        /* we may need up to two bytes across boundary; we cached next sector into fat_cache + SECTOR_SIZE */
+        uint16_t w = fat_cache[in_sector] | (fat_cache[in_sector + 1] << 8);
+        if (cluster & 1) {
+            /* odd cluster: high 12 bits */
+            return (uint32_t)((w >> 4) & 0x0FFF);
+        } else {
+            /* even cluster: low 12 bits */
+            return (uint32_t)(w & 0x0FFF);
+        }
     } else {
-        /* FAT32 unsupported in this implementation */
         return 0xFFFFFFFF;
     }
 }
 
-/* Convert a standard filename into 8.3 padded uppercase array for comparison.
-   buf must be at least 11 bytes. input name can be "FOO.TXT" or "FOO" */
+/* --------------------------------------------------
+   Name helper: convert input string into 11-byte 8.3 uppercase padded with spaces
+   -------------------------------------------------- */
 static void make_8dot3(const char *input, char out11[11]) {
-    /* Fill with spaces */
+    /* fill with spaces */
     for (int i = 0; i < 11; ++i) out11[i] = ' ';
 
-    /* Copy name and extension */
-    const char *dot = strchr(input, '.');
-    int nname = (dot ? (int)(dot - input) : (int)strlen(input));
-    if (nname > 8) nname = 8;
-    int i;
-    for (i = 0; i < nname; ++i) out11[i] = toupper((unsigned char)input[i]);
+    /* find dot (if any) */
+    unsigned int len = kstrlen(input);
+    unsigned int dotpos = len; /* sentinel => no dot */
+    for (unsigned int i = 0; i < len; ++i) {
+        if (input[i] == '.') { dotpos = i; break; }
+    }
 
-    if (dot) {
-        const char *ext = dot + 1;
-        int iext = 0;
-        while (iext < 3 && ext[iext]) {
-            out11[8 + iext] = toupper((unsigned char)ext[iext]);
-            ++iext;
+    unsigned int name_len = (dotpos < len ? dotpos : len);
+    if (name_len > 8) name_len = 8;
+    for (unsigned int i = 0; i < name_len; ++i) {
+        out11[i] = (char)ktoupper((int)input[i]);
+    }
+
+    if (dotpos < len) {
+        /* copy up to 3 extension chars */
+        unsigned int ext_len = len - dotpos - 1;
+        if (ext_len > 3) ext_len = 3;
+        for (unsigned int j = 0; j < ext_len; ++j) {
+            out11[8 + j] = (char)ktoupper((int)input[dotpos + 1 + j]);
         }
     }
 }
 
-/*-------------------- Public API required by assignment --------------------*/
+/* --------------------------------------------------
+   Public API: fatInit, fatOpen, fatRead
+   -------------------------------------------------- */
 
-/*
- * fatInit:
- *  - read the boot sector
- *  - validate signature / basic checks
- *  - read the first FAT into memory (only first FAT required for reading chain)
- *  - compute root_dir_start and first_data_sector
- * Returns 0 on success, -1 on failure.
- */
 int fatInit(void) {
-    unsigned char sector[SECTOR_SIZE];
-    if (read_sectors(0, sector, 1) < 0) return -1;
+    /* Read boot sector (LBA 0). The assignment uses sector 0 as the FS boot sector. */
+    unsigned char tmpbuf[SECTOR_SIZE] __attribute__((aligned(4)));
+    if (read_sectors(0, tmpbuf, 1) < 0) return -1;
 
-    /* copy into typed struct */
-    memcpy(&bootsector_buf, sector, sizeof(struct boot_sector));
+    /* copy into bs struct (avoid memcpy) */
+    kmemcpy(&bs, tmpbuf, sizeof(struct boot_sector));
 
-    /* basic validation: boot signature 0xAA55 (stored little-endian) */
-    if (bootsector_buf.boot_signature != 0xAA55) {
-        /* still continue but warn */
-        /* In kernel you might print; here we return error */
-        return -1;
-    }
+    /* Validate boot signature 0xAA55 (little endian in struct) */
+    if (bs.boot_signature != 0xAA55) return -1;
 
     /* compute layout */
-    compute_layout();
+    reserved_sectors = bs.num_reserved_sectors;
+    num_fats = bs.num_fat_tables;
+    sectors_per_fat = bs.num_sectors_per_fat;
+    root_dir_entries = bs.num_root_dir_entries;
+    sectors_per_cluster = bs.num_sectors_per_cluster;
 
-    /* set global vars we might need */
-    bytes_per_sector = SECTOR_SIZE;
-    fat_sectors = sectors_per_fat;
+    /* total sectors selection */
+    if (bs.total_sectors != 0) total_sectors = bs.total_sectors;
+    else total_sectors = bs.total_sectors_in_fs;
 
-    /* figure out total sectors (already set in compute_layout) and fat_type */
-    determine_fat_type();
-    if (fat_type == 32) {
-        /* FAT32 not supported in this implementation */
-        return -1;
+    /* root dir sectors (each entry 32 bytes) */
+    root_dir_sectors = ((root_dir_entries * 32) + (SECTOR_SIZE - 1)) / SECTOR_SIZE;
+    if (root_dir_sectors > ROOTDIR_MAX_SECTORS) return -1; /* too large for static buffer */
+
+    /* start sectors */
+    root_dir_start = reserved_sectors + (num_fats * sectors_per_fat);
+    first_data_sector = root_dir_start + root_dir_sectors;
+
+    /* determine FAT type by counting clusters */
+    {
+        unsigned int data_sectors = total_sectors - first_data_sector;
+        unsigned int total_clusters = data_sectors / sectors_per_cluster;
+        if (total_clusters < 4085) fat_type = 12;
+        else fat_type = 16; /* we support only 12 or 16 here */
     }
 
-    /* Allocate and read first FAT (we only need one copy to walk chains) */
-    size_t fat_bytes = (size_t)sectors_per_fat * bytes_per_sector;
-    fat_table = (unsigned char*)malloc(fat_bytes);
-    if (!fat_table) return -1;
-    if (read_sectors(reserved_sectors, fat_table, sectors_per_fat) < 0) {
-        free(fat_table);
-        fat_table = NULL;
-        return -1;
-    }
+    /* Pre-read root directory region into buffer */
+    if (read_sectors(root_dir_start, rootdir_buf, root_dir_sectors) < 0) return -1;
+    rootdir_sectors_read = root_dir_sectors;
+
+    /* invalidate fat cache */
+    fat_cache_base_sector = (unsigned int)-1;
 
     return 0;
 }
 
-/*
- * fatOpen:
- *  - open a file (only files in rootdir supported by assignment)
- *  - returns pointer to dynamically allocated struct file (caller must free when done)
- *  - returns NULL on not found / error
- *
- *  filename expected in normal string form e.g. "TEST.TXT" or "README"
- */
+/* file structure returned - same as in your fat.h */
 struct file *fatOpen(const char *filename) {
-    if (!filename || !fat_table) return NULL;
+    if (!filename) return (struct file*)0;
 
-    /* prepare 8.3 for comparison */
-    char want11[11];
-    make_8dot3(filename, want11);
+    char want[11];
+    make_8dot3(filename, want);
 
-    /* read root directory region (root_dir_sectors long) into buffer */
-    size_t rbsz = root_dir_sectors * SECTOR_SIZE;
-    unsigned char *rdbuf = (unsigned char*)malloc(rbsz);
-    if (!rdbuf) return NULL;
+    /* iterate root directory entries (each 32 bytes) */
+    unsigned int entries = root_dir_entries;
+    unsigned char *ptr = rootdir_buf;
+    for (unsigned int i = 0; i < entries; ++i) {
+        unsigned char first = ptr[0];
+        if (first == 0x00) break;   /* no more files */
+        if (first == 0xE5) { ptr += 32; continue; } /* deleted */
+        uint8_t attr = ptr[11];
+        if (attr & 0x08) { ptr += 32; continue; } /* volume label skip */
 
-    if (read_sectors(root_dir_start_sector, rdbuf, root_dir_sectors) < 0) {
-        free(rdbuf);
-        return NULL;
-    }
+        /* compare 11-byte filename */
+        if (kmemcmp(ptr, want, 11) == 0) {
+            /* copy into returned struct file (use static allocation) */
+            static struct file fbuf; /* single-file support; assignment didn't require multi-open */
+            /* zero it */
+            for (unsigned int z = 0; z < sizeof(struct file); ++z) ((unsigned char*)&fbuf)[z] = 0;
 
-    /* iterate over entries: each entry is 32 bytes */
-    int entries = (int)root_dir_entries;
-    for (int i = 0; i < entries; ++i) {
-        unsigned char *entry = rdbuf + (i * 32);
-        /* first byte 0x00 => no more entries; 0xE5 => deleted */
-        unsigned char first = entry[0];
-        if (first == 0x00) break;
-        if (first == 0xE5) continue;
-
-        /* skip volume labels and directories if attribute indicates */
-        uint8_t attr = entry[11];
-        if (attr & 0x08) continue; /* volume label */
-
-        /* compare name+ext (11 bytes) */
-        if (memcmp(entry, want11, 11) == 0) {
-            /* found */
-            struct file *f = (struct file*)malloc(sizeof(struct file));
-            if (!f) { free(rdbuf); return NULL; }
-            memset(f, 0, sizeof(*f));
-            /* copy RDE into file->rde */
-            memcpy(&f->rde, entry, sizeof(struct root_directory_entry));
-            /* cluster field in RDE is 16-bit for FAT12/16 */
-            f->start_cluster = f->rde.cluster;
-            free(rdbuf);
-            return f;
+            /* copy rde bytes into fbuf.rde */
+            for (unsigned int j = 0; j < sizeof(struct root_directory_entry); ++j) {
+                ((unsigned char*)&fbuf.rde)[j] = ptr[j];
+            }
+            /* cluster field is 16-bit in root entry for FAT12/16 */
+            fbuf.start_cluster = fbuf.rde.cluster;
+            return &fbuf;
         }
+
+        ptr += 32;
     }
 
-    free(rdbuf);
-    return NULL;
+    return (struct file*)0; /* not found */
 }
 
-/*
- * fatRead:
- *  - read 'count' bytes from file into buffer 'buf' starting at file offset 'offset'
- *  - returns number of bytes actually read (0..count) or -1 on error
- *
- * Note: This implementation follows cluster chains using the loaded FAT and reads
- * clusters using ata_lba_read.
- */
+/* Read 'count' bytes from file 'f' starting at 'offset' into 'buf'.
+   Returns bytes read or -1 on error. */
 int fatRead(struct file *f, void *buf, uint32_t count, uint32_t offset) {
-    if (!f || !buf || !fat_table) return -1;
+    if (!f || !buf) return -1;
 
     uint32_t file_size = f->rde.file_size;
-    if (offset >= file_size) return 0; /* nothing to read */
-
-    /* clamp count to remaining bytes */
+    if (offset >= file_size) return 0;
     if (offset + count > file_size) count = file_size - offset;
 
-    uint8_t *out = (uint8_t*)buf;
-    uint32_t bytes_per_cluster = (uint32_t)sectors_per_cluster * bytes_per_sector;
+    unsigned char *out = (unsigned char*)buf;
+    uint32_t bytes_per_cluster = sectors_per_cluster * SECTOR_SIZE;
 
-    /* find cluster containing 'offset' */
+    /* find initial cluster and offset within it */
     uint32_t cluster = f->start_cluster;
-    if (cluster < 2) return -1; /* invalid start */
+    if (cluster < 2) return -1;
 
     uint32_t cluster_index = offset / bytes_per_cluster;
-    uint32_t cluster_offset = offset % bytes_per_cluster;
+    uint32_t cluster_off = offset % bytes_per_cluster;
 
-    /* walk cluster_index times */
+    /* advance cluster chain cluster_index times */
     for (uint32_t i = 0; i < cluster_index; ++i) {
         uint32_t next = get_fat_entry(cluster);
-        if (next >= 0xFFF8 && fat_type == 16) { /* EOF for FAT16 */
-            return 0; /* offset beyond EOF */
+        if (next == 0xFFFFFFFF) return -1;
+        /* check for EOF markers */
+        if (fat_type == 16) {
+            if (next >= 0xFFF8) return 0;
+        } else {
+            if (next >= 0xFF8) return 0;
         }
-        if (fat_type == 12 && next >= 0xFF8) {
-            return 0;
-        }
-        if (next == 0x0000 || next == 0xFFFFFFFF) return -1;
         cluster = next;
     }
 
     uint32_t bytes_read = 0;
+    unsigned char cluster_buf[SECTOR_SIZE * 4]; /* support up to 4 sectors per cluster on small systems; adjust if needed */
+    if (sectors_per_cluster > 4) { /* safety: if cluster bigger than our temp buffer, fail (or handle per-sector) */
+        /* fallback: read sector-by-sector (per-sector loop) */
+        /* We'll implement per-sector read path below */
+    }
+
     while (bytes_read < count) {
-        /* compute first sector of this cluster */
-        uint32_t first_sector_of_cluster = first_data_sector + (cluster - 2) * sectors_per_cluster;
+        uint32_t first_sector = first_data_sector + (cluster - 2) * sectors_per_cluster;
 
-        /* read entire cluster into a temporary buffer (or directly read needed sectors) */
-        unsigned char *cluster_buf = (unsigned char*)malloc(bytes_per_cluster);
-        if (!cluster_buf) return -1;
-        if (read_sectors(first_sector_of_cluster, cluster_buf, sectors_per_cluster) < 0) {
-            free(cluster_buf);
-            return -1;
-        }
-
-        /* how many bytes we can copy from this cluster starting at cluster_offset */
-        uint32_t to_copy = bytes_per_cluster - cluster_offset;
-        if (to_copy > (count - bytes_read)) to_copy = (count - bytes_read);
-
-        memcpy(out + bytes_read, cluster_buf + cluster_offset, to_copy);
-        bytes_read += to_copy;
-        free(cluster_buf);
-
-        /* move to next cluster */
-        if (bytes_read >= count) break;
-        cluster_offset = 0; /* subsequent clusters start at 0 */
-        uint32_t next = get_fat_entry(cluster);
-        if (fat_type == 16) {
-            if (next >= 0xFFF8) break; /* EOF */
-        } else if (fat_type == 12) {
-            if (next >= 0xFF8) break;
+        /* if cluster fits into our cluster_buf */
+        if (sectors_per_cluster <= 4) {
+            if (read_sectors(first_sector, cluster_buf, sectors_per_cluster) < 0) return -1;
+            uint32_t can_copy = bytes_per_cluster - cluster_off;
+            if (can_copy > (count - bytes_read)) can_copy = (count - bytes_read);
+            /* copy */
+            for (uint32_t k = 0; k < can_copy; ++k) {
+                out[bytes_read + k] = cluster_buf[cluster_off + k];
+            }
+            bytes_read += can_copy;
         } else {
-            return -1;
+            /* per-sector read - simpler but slower */
+            for (unsigned int s = 0; s < sectors_per_cluster && bytes_read < count; ++s) {
+                unsigned char sector_temp[SECTOR_SIZE];
+                if (read_sectors(first_sector + s, sector_temp, 1) < 0) return -1;
+                uint32_t start = (s == 0 ? cluster_off : 0);
+                for (uint32_t k = start; k < SECTOR_SIZE && bytes_read < count; ++k) {
+                    out[bytes_read++] = sector_temp[k];
+                }
+            }
         }
-        if (next == 0x0000 || next == 0xFFFFFFFF) return -1;
+
+        if (bytes_read >= count) break;
+
+        cluster_off = 0; /* subsequent clusters start at 0 */
+        uint32_t next = get_fat_entry(cluster);
+        if (next == 0xFFFFFFFF) return -1;
+        if (fat_type == 16) {
+            if (next >= 0xFFF8) break;
+        } else {
+            if (next >= 0xFF8) break;
+        }
         cluster = next;
     }
 
     return (int)bytes_read;
-}
-
-/* Optional helper to free resources (not required but helpful for tests) */
-void fatShutdown(void) {
-    if (fat_table) {
-        free(fat_table);
-        fat_table = NULL;
-    }
 }
