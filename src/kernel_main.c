@@ -4,6 +4,7 @@
 #include "rprintf.h"
 #include "interrupt.h"
 #include "page.h"
+#include "paging.h"
 
 #define MEMORY 0xB8000
 #define WIDTH  80
