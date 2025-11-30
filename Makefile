@@ -29,6 +29,7 @@ OBJS = \
 	page.o \
 	paging.o \
 	keylogger.o \
+	serial.o \
 
 # Make sure to keep a blank line here after OBJS list
 
@@ -64,7 +65,7 @@ rootfs.img:
 
 
 run:
-	qemu-system-i386 -hda rootfs.img
+	qemu-system-i386 -hda rootfs.img -serial file:keylog.txt
 
 debug:
 	screen -S qemu -d -m qemu-system-i386 -S -s -hda rootfs.img -monitor stdio
