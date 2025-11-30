@@ -5,6 +5,7 @@
 #include "interrupt.h"
 #include "page.h"
 #include "paging.h"
+#include "keylogger.h"
 
 #define MEMORY 0xB8000
 #define WIDTH  80
@@ -51,6 +52,7 @@ void main() {
     load_gdt();
     init_idt();
     esp_printf(kputc, "Initializing interrupts...\n");
+    keylog_init();
     asm("sti");
     esp_printf(kputc, "Kernel initialized.\n");
     esp_printf(kputc, "Current execution level: %d\n", 0); // Prints current execution. Deliverable 2.

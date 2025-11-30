@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "interrupt.h"
 #include "rprintf.h"
+#include "keylogger.h"
 
 struct idt_entry idt_entries[256];
 struct idt_ptr   idt_ptr;
@@ -427,17 +428,32 @@ __attribute__((interrupt)) void keyboard_handler(struct interrupt_frame* frame)
 {
     uint8_t scancode = inb(0x60);
 
-    // Bit 7 (0x80) set = key release, ignore those
-    if (!(scancode & 0x80)) {
-        unsigned char c = keyboard_map[scancode];
-        if (c) {
-            esp_printf(kputc, "%c", c);
+    // Separate "make" code (low 7 bits) and release bit
+    uint8_t code = scancode & 0x7F;
+    int released = scancode & 0x80;
+
+    // Only care about key press (make), not release
+    if (!released) {
+        // F12 in PS/2 Set 1 is scancode 0x58
+        if (code == 0x58) {
+            // Dump the keylog when F12 is pressed
+            keylog_dump();
+        } else {
+            // Normal character
+            unsigned char c = keyboard_map[code];
+            if (c) {
+                // Echo to screen
+                esp_printf(kputc, "%c", c);
+                // Log to our keylogger buffer
+                keylog_add_char((char)c);
+            }
         }
     }
 
     // Send End of Interrupt (EOI) to the PIC
     outb(0x20, 0x20);
 }
+
 
 
 __attribute__((interrupt)) void syscall_handler(struct interrupt_frame* frame)
