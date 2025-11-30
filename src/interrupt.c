@@ -65,6 +65,45 @@ unsigned char keyboard_map[128] =
    0,  /* All other keys are undefined */
 };
 
+unsigned char keyboard_map_shift[128] =
+{
+   0,  27, '!', '@', '#', '$', '%', '^', '&', '*',     
+ '(', ')', '_', '+', '\b',
+ '\t',
+ 'Q', 'W', 'E', 'R',
+ 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+   0,
+ 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':',
+ '"', '~',   0,
+ '|', 'Z', 'X', 'C', 'V', 'B', 'N',
+ 'M', '<', '>', '?',   0,
+ '*',
+   0,
+ ' ',
+   0,
+   0,0,0,0,0,0,0,0,
+   0,
+   0,
+   0,
+   0,
+   0,
+ '-',
+   0,
+   0,
+   0,
+ '+',
+   0,
+   0,
+   0,
+   0,
+   0,
+   0, 0, 0,
+   0,
+   0,
+   0
+};
+
+
 /*
  * outb
  *
@@ -424,36 +463,50 @@ __attribute__((interrupt)) void pit_handler(struct interrupt_frame* frame)
 }
 
 extern int kputc(int);
+static int shift_pressed = 0;
+
 __attribute__((interrupt)) void keyboard_handler(struct interrupt_frame* frame)
 {
     uint8_t scancode = inb(0x60);
-
-    // Separate "make" code (low 7 bits) and release bit
     uint8_t code = scancode & 0x7F;
     int released = scancode & 0x80;
 
-    // Only care about key press (make), not release
+    // SHIFT HANDLING
+    if (code == 0x2A || code == 0x36) {   // left or right shift
+        if (!released)
+            shift_pressed = 1;   // key down
+        else
+            shift_pressed = 0;   // key up
+
+        outb(0x20, 0x20);
+        return;
+    }
+
+    // F12 dump stays the same
+    if (!released && code == 0x58) {
+        keylog_dump();
+        outb(0x20, 0x20);
+        return;
+    }
+
+    // CHARACTER TYPING
     if (!released) {
-        // F12 in PS/2 Set 1 is scancode 0x58
-        if (code == 0x58) {
-            // Dump the keylog when F12 is pressed
-            keylog_dump();
-        } else {
-            // Normal character
-            unsigned char c = keyboard_map[code];
-            if (c) {
-                // Echo to screen
-                esp_printf(kputc, "%c", c);
-                // Log to our keylogger buffer
-                keylog_add_char((char)c);
-            }
+        unsigned char c;
+
+        if (shift_pressed)
+            c = keyboard_map_shift[code];
+        else
+            c = keyboard_map[code];
+
+        if (c) {
+            esp_printf(kputc, "%c", c);
+            keylog_add_char(c);
         }
     }
 
-    // Send End of Interrupt (EOI) to the PIC
+    // EOI
     outb(0x20, 0x20);
 }
-
 
 
 __attribute__((interrupt)) void syscall_handler(struct interrupt_frame* frame)
