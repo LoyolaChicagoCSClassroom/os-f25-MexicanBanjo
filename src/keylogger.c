@@ -23,7 +23,7 @@ void keylog_init(void) {
 /*
  * Log one character:
  * 1. Save to ring buffer (for F12 dumping)
- * 2. Send out of COM1 so QEMU writes it to host log file
+ * 2. Send out so QEMU writes it to host log file
  */
 void keylog_add_char(char c) {
 
@@ -41,7 +41,6 @@ void keylog_add_char(char c) {
         keylog_full = 1;
     }
 
-    // 2. Send to host via COM1 serial port
     serial_write(c);
 }
 
