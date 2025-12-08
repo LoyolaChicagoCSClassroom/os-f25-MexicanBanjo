@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include "rprintf.h"
 #include "keylogger.h"
-#include "serial.h"     // <---- NEW include
+#include "serial.h"    
 
 extern int kputc(int); // VGA output
 
